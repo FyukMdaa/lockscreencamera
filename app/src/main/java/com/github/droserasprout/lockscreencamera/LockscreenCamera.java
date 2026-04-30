@@ -18,6 +18,8 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.MediaStore;
 import android.util.Log;
+import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -30,15 +32,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedModuleInterface;
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam;
 
@@ -46,7 +45,6 @@ public class LockscreenCamera extends XposedModule {
 
     private static final String TAG = "LockscreenCamera";
 
-    // ドキュメント: "public XposedModule()" — 引数なし
     public LockscreenCamera() {
         super();
     }
@@ -84,21 +82,18 @@ public class LockscreenCamera extends XposedModule {
         public static void start() {
             isActive.set(true);
             SESSION_URIS.clear();
-            Log.i(TAG, "Secure Camera Session Started");
+            Log.i(TAG, "Session Started");
         }
 
         public static void end() {
             isActive.set(false);
             SESSION_URIS.clear();
-            Log.i(TAG, "Secure Camera Session Cleared");
+            Log.i(TAG, "Session Cleared");
         }
 
         public static void add(Uri uri) {
             if (isActive.get() && uri != null) {
-                boolean added = SESSION_URIS.add(uri);
-                if (added) {
-                    Log.d(TAG, "Added to Session: " + uri + " | Total: " + SESSION_URIS.size());
-                }
+                SESSION_URIS.add(uri);
             }
         }
 
@@ -132,7 +127,7 @@ public class LockscreenCamera extends XposedModule {
     }
 
     // =========================================================================
-    // XposedModule ライフサイクル
+    // XposedModule Lifecycle
     // =========================================================================
 
     @Override
@@ -140,19 +135,21 @@ public class LockscreenCamera extends XposedModule {
         String pkg = param.getPackageName();
         if (!isCameraPackage(pkg)) return;
 
-        log(Log.INFO, TAG, "Targeting Camera App: " + pkg);
-
-        // 0. View の非表示化・透明化を阻止
-        // Chain.getArgs() の戻り値は immutable なため、引数変更には
-        // chain.proceed(Object[] args) を使用する
+        // 1. Viewの可視性制御
+        // DecorView および カメラプレビュー用 View (SurfaceView/TextureView) のみを保護対象とし、
+        // ローディング表示・ダイアログ・アニメーション等への干渉を避ける
         try {
             hook(View.class.getDeclaredMethod("setVisibility", int.class))
                 .intercept(chain -> {
                     View view = (View) chain.getThisObject();
                     if (isCameraContext(view.getContext())) {
-                        int vis = (int) chain.getArg(0);
-                        if (vis != View.VISIBLE) {
-                            return chain.proceed(new Object[]{View.VISIBLE});
+                        if (isDecorView(view)
+                                || view instanceof SurfaceView
+                                || view instanceof TextureView) {
+                            int vis = (int) chain.getArg(0);
+                            if (vis != View.VISIBLE) {
+                                return chain.proceed(new Object[]{View.VISIBLE});
+                            }
                         }
                     }
                     return chain.proceed();
@@ -161,33 +158,34 @@ public class LockscreenCamera extends XposedModule {
             hook(View.class.getDeclaredMethod("setAlpha", float.class))
                 .intercept(chain -> {
                     View view = (View) chain.getThisObject();
-                    if (isDecorView(view) && isCameraContext(view.getContext())) {
-                        float alpha = (float) chain.getArg(0);
-                        if (alpha < 1.0f) {
-                            return chain.proceed(new Object[]{1.0f});
+                    if (isCameraContext(view.getContext())) {
+                        if (isDecorView(view)
+                                || view instanceof SurfaceView
+                                || view instanceof TextureView) {
+                            float alpha = (float) chain.getArg(0);
+                            if (alpha < 1.0f) {
+                                return chain.proceed(new Object[]{1.0f});
+                            }
                         }
                     }
                     return chain.proceed();
                 });
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "View hook failed", t);
+            log(Log.ERROR, TAG, "View visibility control failed", t);
         }
 
-        // 1. Keyguard 解除要求（PIN 画面）を完全にブロック
+        // 2. Keyguard解除要求の制御
         try {
             Method dismissMethod = KeyguardManager.class.getDeclaredMethod(
                 "requestDismissKeyguard",
                 Activity.class,
                 KeyguardManager.KeyguardDismissCallback.class);
-            hook(dismissMethod).intercept(chain -> {
-                log(Log.WARN, TAG, "BLOCKED: requestDismissKeyguard (Preventing PIN screen)");
-                return null;
-            });
+            hook(dismissMethod).intercept(chain -> null);
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "requestDismissKeyguard hook failed", t);
+            log(Log.WARN, TAG, "requestDismissKeyguard control failed", t);
         }
 
-        // 2. Activity Visibility Spoofing
+        // 3. Activityのフォーカス状態制御
         try {
             hook(Activity.class.getDeclaredMethod("hasWindowFocus"))
                 .intercept(chain -> {
@@ -200,10 +198,10 @@ public class LockscreenCamera extends XposedModule {
                     return chain.proceed();
                 });
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Activity visibility hook failed", t);
+            log(Log.WARN, TAG, "Activity visibility control failed", t);
         }
 
-        // 3. Intent の動的書き換え
+        // 4. Intentのパラメータ調整
         try {
             hook(Activity.class.getDeclaredMethod("getIntent"))
                 .intercept(chain -> {
@@ -218,14 +216,14 @@ public class LockscreenCamera extends XposedModule {
                     return intent;
                 });
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "getIntent hook failed", t);
+            log(Log.WARN, TAG, "getIntent control failed", t);
         }
 
-        // 4. Secure Gallery Redirect
+        // 5. ギャラリー呼び出しのインテント制御
         try {
             hook(Activity.class.getDeclaredMethod("startActivity", Intent.class))
                 .intercept(chain -> {
-                    handleGalleryRedirect(
+                    handleGalleryIntent(
                         (Context) chain.getThisObject(),
                         (Intent) chain.getArg(0));
                     return chain.proceed();
@@ -234,7 +232,7 @@ public class LockscreenCamera extends XposedModule {
             hook(Activity.class.getDeclaredMethod(
                     "startActivityForResult", Intent.class, int.class))
                 .intercept(chain -> {
-                    handleGalleryRedirect(
+                    handleGalleryIntent(
                         (Context) chain.getThisObject(),
                         (Intent) chain.getArg(0));
                     return chain.proceed();
@@ -242,27 +240,29 @@ public class LockscreenCamera extends XposedModule {
 
             hook(ContextWrapper.class.getDeclaredMethod("startActivity", Intent.class))
                 .intercept(chain -> {
-                    handleGalleryRedirect(
+                    handleGalleryIntent(
                         (Context) chain.getThisObject(),
                         (Intent) chain.getArg(0));
                     return chain.proceed();
                 });
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "Failed to hook gallery redirect", t);
+            log(Log.ERROR, TAG, "startActivity control failed", t);
         }
 
-        // 5. ライフサイクルフック
+        // 6. ライフサイクルイベントの監視
+        // screenOffReceiver を onDestroy で解除できるよう Activity をキーにした Map で管理する
+        // attachBaseContext は this が ContextWrapper であり Activity にならないため除外
+        final Map<Activity, BroadcastReceiver> receiverMap = new ConcurrentHashMap<>();
+
         String[] criticalMethods = {
-            "attachBaseContext", "onCreate", "onStart", "onResume",
+            "onCreate", "onStart", "onResume",
             "onWindowFocusChanged", "onDestroy"
         };
 
         for (String mname : criticalMethods) {
             try {
                 final Method m;
-                if ("attachBaseContext".equals(mname)) {
-                    m = ContextWrapper.class.getDeclaredMethod("attachBaseContext", Context.class);
-                } else if ("onCreate".equals(mname)) {
+                if ("onCreate".equals(mname)) {
                     m = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
                 } else if ("onWindowFocusChanged".equals(mname)) {
                     m = Activity.class.getDeclaredMethod("onWindowFocusChanged", boolean.class);
@@ -284,17 +284,26 @@ public class LockscreenCamera extends XposedModule {
                         if (SessionManager.isActive.get()) {
                             SessionManager.end();
                         }
+                        // 登録済みレシーバーを解除してリークを防ぐ
+                        BroadcastReceiver receiver = receiverMap.remove(act);
+                        if (receiver != null) {
+                            try {
+                                act.unregisterReceiver(receiver);
+                            } catch (Exception ignored) {}
+                        }
                         return chain.proceed();
                     }
 
                     if ("onWindowFocusChanged".equals(methodName)) {
                         boolean hasFocus = (boolean) chain.getArg(0);
                         if (!hasFocus) return chain.proceed();
+                        // フォーカス取得時は軽量更新のみ。Window属性の再適用によるバトルを防ぐ
+                        applyWindowAttributes(act, true);
+                        return chain.proceed();
                     }
 
                     if ("onCreate".equals(methodName)) {
                         Object res = chain.proceed();
-
                         Intent intent = act.getIntent();
                         boolean isLockscreenLaunch = intent != null &&
                             intent.getBooleanExtra(
@@ -302,8 +311,6 @@ public class LockscreenCamera extends XposedModule {
 
                         if (isLockscreenLaunch) {
                             SessionManager.start();
-                            log(Log.INFO, TAG,
-                                "Secure Lockscreen launch detected. Session Started.");
 
                             IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
                             BroadcastReceiver screenOffReceiver = new BroadcastReceiver() {
@@ -321,81 +328,67 @@ public class LockscreenCamera extends XposedModule {
                                 } else {
                                     act.registerReceiver(screenOffReceiver, filter);
                                 }
+                                // onDestroy で解除できるよう Map に保持
+                                receiverMap.put(act, screenOffReceiver);
                             } catch (Exception e) {
-                                log(Log.WARN, TAG,
-                                    "Failed to register receiver: " + e.getMessage());
+                                log(Log.WARN, TAG, "Failed to register screen off receiver", e);
                             }
                         }
 
-                        applyWindowAndBufferFixes(act);
+                        // onCreate のみフル適用
+                        applyWindowAttributes(act, false);
                         return res;
                     }
 
-                    applyWindowAndBufferFixes(act);
+                    // onStart / onResume は軽量更新のみ。フル適用はバトルの原因になる
+                    applyWindowAttributes(act, true);
                     return chain.proceed();
                 });
             } catch (Throwable t) {
-                log(Log.WARN, TAG, "Lifecycle hook failed for " + mname, t);
+                log(Log.WARN, TAG, "Lifecycle method control failed: " + mname, t);
             }
         }
 
-        // 6. 写真保存のトラッキング
-        try {
-            hook(ContentResolver.class.getDeclaredMethod(
-                    "insert", Uri.class, ContentValues.class))
-                .intercept(chain -> {
-                    Uri returnedUri = (Uri) chain.proceed();
-                    if (SessionManager.isActive.get() && returnedUri != null) {
-                        SessionManager.add(returnedUri);
-                    }
-                    return returnedUri;
-                });
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "ContentResolver.insert hook failed", t);
-        }
-
+        // 7. 保存されたメディアのトラッキング（書き込み完了時のみ）
+        // IS_PENDING=0 への update をもって保存完了とみなす。
+        // insert フックは「仮URI」を拾ってしまうため使用しない。
         try {
             hook(ContentResolver.class.getDeclaredMethod(
                     "update", Uri.class, ContentValues.class, String.class, String[].class))
                 .intercept(chain -> {
+                    Object result = chain.proceed();
                     if (SessionManager.isActive.get()) {
                         Uri uri = (Uri) chain.getArg(0);
                         ContentValues values = (ContentValues) chain.getArg(1);
 
                         if (uri != null && values != null) {
-                            boolean isFinished = false;
-                            if (Build.VERSION.SDK_INT >= 29 &&
-                                values.containsKey(MediaStore.MediaColumns.IS_PENDING)) {
-                                isFinished =
-                                    ((Integer) values.get(
-                                        MediaStore.MediaColumns.IS_PENDING)) == 0;
+                            if (Build.VERSION.SDK_INT >= 29
+                                    && values.containsKey(MediaStore.MediaColumns.IS_PENDING)) {
+                                Integer pending =
+                                    values.getAsInteger(MediaStore.MediaColumns.IS_PENDING);
+                                if (pending != null && pending == 0) {
+                                    SessionManager.add(uri);
+                                }
                             } else if (values.containsKey(MediaStore.Images.Media.DATA)) {
-                                isFinished = true;
-                            }
-                            if (isFinished) {
                                 SessionManager.add(uri);
                             }
                         }
                     }
-                    return chain.proceed();
+                    return result;
                 });
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "ContentResolver.update hook failed", t);
+            log(Log.WARN, TAG, "ContentResolver.update control failed", t);
         }
 
-        // 7. その他システムフック群
+        // 8. システムサービスの制御
         try {
             Class<?> callbackClass = Class.forName(
                 "android.hardware.camera2.CameraManager$AvailabilityCallback",
                 true, param.getClassLoader());
             hook(callbackClass.getDeclaredMethod("onCameraUnavailable", String.class))
-                .intercept(chain -> {
-                    log(Log.INFO, TAG,
-                        "Blocked onCameraUnavailable for ID: " + chain.getArg(0));
-                    return null;
-                });
+                .intercept(chain -> null);
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "CameraAvailabilityCallback hook failed", t);
+            log(Log.WARN, TAG, "CameraManager.AvailabilityCallback control failed", t);
         }
 
         try {
@@ -404,7 +397,7 @@ public class LockscreenCamera extends XposedModule {
             hook(biometricClass.getDeclaredMethod("canAuthenticate", int.class))
                 .intercept(chain -> 0);
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "BiometricManager hook failed", t);
+            log(Log.WARN, TAG, "BiometricManager.canAuthenticate control failed", t);
         }
     }
 
@@ -420,8 +413,7 @@ public class LockscreenCamera extends XposedModule {
                 try {
                     Method getContextMethod =
                         chain.getThisObject().getClass().getMethod("getContext");
-                    Context context =
-                        (Context) getContextMethod.invoke(chain.getThisObject());
+                    Context context = (Context) getContextMethod.invoke(chain.getThisObject());
 
                     KeyguardManager km =
                         (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
@@ -434,10 +426,8 @@ public class LockscreenCamera extends XposedModule {
                         pm.resolveActivity(resolveIntent, PackageManager.MATCH_DEFAULT_ONLY);
 
                     if (info == null || info.activityInfo.name.contains("Resolver")) {
-                        resolveIntent =
-                            new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA);
-                        info = pm.resolveActivity(
-                            resolveIntent, PackageManager.MATCH_DEFAULT_ONLY);
+                        resolveIntent = new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA);
+                        info = pm.resolveActivity(resolveIntent, PackageManager.MATCH_DEFAULT_ONLY);
                     }
 
                     String targetPkg = "com.android.camera";
@@ -489,17 +479,17 @@ public class LockscreenCamera extends XposedModule {
                     context.startActivity(intent, options.toBundle());
                     return true;
                 } catch (Throwable t) {
-                    log(Log.ERROR, TAG, "Failed to launch", t);
+                    log(Log.ERROR, TAG, "Gesture camera launch control failed", t);
                 }
                 return chain.proceed();
             });
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "System hook skipped", t);
+            log(Log.WARN, TAG, "GestureLauncherService control failed", t);
         }
     }
 
     // =========================================================================
-    // ヘルパーメソッド群
+    // Helpers
     // =========================================================================
 
     private boolean isCameraPackage(String pkg) {
@@ -535,7 +525,7 @@ public class LockscreenCamera extends XposedModule {
         return v != null && v.getClass().getName().endsWith("DecorView");
     }
 
-    private void handleGalleryRedirect(Context ctx, Intent intent) {
+    private void handleGalleryIntent(Context ctx, Intent intent) {
         if (ctx == null || intent == null || intent.getAction() == null) return;
         if (!SessionManager.isActive.get()) return;
 
@@ -562,8 +552,6 @@ public class LockscreenCamera extends XposedModule {
             || action.contains("STILL_IMAGE_CAMERA");
 
         if (!isGallery) return;
-
-        Log.i(TAG, "Redirecting to SecureViewer: Force hijacking intent");
 
         ArrayList<Uri> uriList = new ArrayList<>(SessionManager.SESSION_URIS);
         if (uriList.isEmpty() && intent.getData() != null) {
@@ -601,11 +589,14 @@ public class LockscreenCamera extends XposedModule {
         intent.addFlags(FLAG_SHOW_WHEN_LOCKED_COMPAT
             | FLAG_DISMISS_KEYGUARD_COMPAT
             | FLAG_TURN_SCREEN_ON_COMPAT);
-
-        Log.d(TAG, "Intent modification complete. Proceeding with hijacked intent.");
     }
 
-    private void applyWindowAndBufferFixes(Activity activity) {
+    /**
+     * @param lightUpdate true のとき Window 属性の再適用を省略する。
+     *                    onWindowFocusChanged 等の高頻度コールバックから呼ぶ際に使用し、
+     *                    setAttributes/addFlags の連続呼び出しによるフォーカス再計算ループを防ぐ。
+     */
+    private void applyWindowAttributes(Activity activity, boolean lightUpdate) {
         try {
             activity.setShowWhenLocked(true);
             activity.setTurnScreenOn(true);
@@ -614,31 +605,31 @@ public class LockscreenCamera extends XposedModule {
             }
 
             Window window = activity.getWindow();
-            if (window != null) {
+            if (window != null && !lightUpdate) {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
                 window.setFormat(PixelFormat.TRANSLUCENT);
 
-                WindowManager.LayoutParams lp = window.getAttributes();
-                lp.flags |= WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                // setAttributes + addFlags を連続して呼ぶとフレームワークがフォーカス再計算を
+                // 繰り返しバトル状態に陥るため、window.setFlags で一括指定する
+                final int addFlags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
                     | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_FULLSCREEN
                     | WindowManager.LayoutParams.FLAG_ALLOW_LOCK_WHILE_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                    | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
 
-                lp.flags &= ~WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD;
+                // FLAG_DISMISS_KEYGUARD を除外マスクに含めてクリアしつつ、他フラグを一括セット
+                window.setFlags(addFlags,
+                    addFlags | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    WindowManager.LayoutParams lp = window.getAttributes();
                     lp.layoutInDisplayCutoutMode =
                         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                    window.setAttributes(lp);
                 }
-                window.setAttributes(lp);
-                window.addFlags(lp.flags);
-                window.setFlags(
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
-                );
 
                 View decorView = window.getDecorView();
                 if (decorView != null) {
@@ -657,7 +648,7 @@ public class LockscreenCamera extends XposedModule {
             SessionManager.setFieldFast(activity, "mIsSecureCameraId", 0);
 
         } catch (Throwable t) {
-            log(Log.DEBUG, TAG, "UI Fixes failed: " + t.toString());
+            log(Log.DEBUG, TAG, "Window attribute application failed: " + t.toString());
         }
     }
 }
